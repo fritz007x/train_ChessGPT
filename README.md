@@ -1,3 +1,14 @@
+# Attribution
+
+This repository is a derivative work, not an original project. It started as a clone of
+[adamkarvonen/train_ChessGPT](https://github.com/adamkarvonen/train_ChessGPT), which is
+itself built on [Andrej Karpathy's nanoGPT](https://github.com/karpathy/nanoGPT). The full
+original commit history is preserved here, so the "Contributors" list on this repo reflects
+real authorship of the base code. My own additions on top are the play/GUI interfaces
+(`play.py`, `gui.py`, `engine.py`), the packed-attention scoring support in `model.py`, the
+Hugging Face Hub integration in `train.py`, and the `hf_space/` deployment setup — see the
+git log for the exact diff. Licensed MIT, same as upstream (see `LICENSE`).
+
 # QUICKSTART
 
 ```
