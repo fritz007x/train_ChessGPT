@@ -29,6 +29,12 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
 
+try:
+    from huggingface_hub import HfApi, hf_hub_download
+    _HAS_HF = True
+except ImportError:
+    _HAS_HF = False
+
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
@@ -43,6 +49,7 @@ init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
+wandb_run_id = '' # set a stable id to make the run resumable across sessions
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
@@ -72,6 +79,8 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
+hf_repo_id = '' # if set, push ckpt.pt after every save and (with resume_from_hf) pull it on start
+resume_from_hf = False
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -141,6 +150,19 @@ if os.path.exists(meta_path):
         meta = pickle.load(f)
     meta_vocab_size = meta['vocab_size']
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
+
+# resume-from-HF: download ckpt.pt before deciding scratch vs resume so init_from dispatches correctly
+if resume_from_hf and hf_repo_id and _HAS_HF and master_process:
+    local_ckpt = os.path.join(out_dir, 'ckpt.pt')
+    if os.path.exists(local_ckpt):
+        init_from = 'resume'
+    else:
+        try:
+            hf_hub_download(repo_id=hf_repo_id, filename='ckpt.pt',
+                            local_dir=out_dir, local_dir_use_symlinks=False)
+            init_from = 'resume'
+        except Exception as e:
+            print(f"resume_from_hf: no remote ckpt ({e}); starting from scratch")
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
@@ -243,7 +265,13 @@ def get_lr(it):
 # logging
 if wandb_log and master_process:
     import wandb
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+    wandb_init_kwargs = dict(project=wandb_project, name=wandb_run_name, config=config)
+    if wandb_run_id:
+        wandb_init_kwargs.update(id=wandb_run_id, resume='allow')
+    wandb.init(**wandb_init_kwargs)
+
+hf_api = HfApi() if (hf_repo_id and _HAS_HF) else None
+hf_upload_future = None
 
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
@@ -283,6 +311,18 @@ while True:
                 }
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                if hf_repo_id and _HAS_HF:
+                    # background the upload so the next ~2000 training iters overlap with it
+                    if hf_upload_future is not None and not hf_upload_future.done():
+                        print("waiting for previous HF upload to finish before queuing next...")
+                        hf_upload_future.result()
+                    hf_upload_future = hf_api.upload_file(
+                        path_or_fileobj=os.path.join(out_dir, 'ckpt.pt'),
+                        path_in_repo='ckpt.pt',
+                        repo_id=hf_repo_id,
+                        commit_message=f"ckpt iter={iter_num} val_loss={best_val_loss:.4f}",
+                        run_as_future=True,
+                    )
     if iter_num == 0 and eval_only:
         break
 
@@ -342,6 +382,10 @@ while True:
     # termination conditions
     if iter_num > max_iters:
         break
+
+if hf_upload_future is not None and not hf_upload_future.done():
+    print("waiting for final HF upload to finish...")
+    hf_upload_future.result()
 
 if ddp:
     destroy_process_group()
