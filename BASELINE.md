@@ -121,6 +121,133 @@ Pairing the colour-reversed games does not rescue this: it moved the interval fr
 [+20, +236] to [+23, +232], i.e. not at all. The variance is between openings, not between
 the two colours of one opening.
 
+## Phase 3 pre-flight: is the hanging-piece filter worth building?
+
+Measured 2026-08-21, before writing any of it. The planned Phase 3 rests on a claim nobody had
+checked - that the dominant failure of 1-ply policy play is moving a piece somewhere it is
+simply lost - and Phase 1 had already inverted one such intuition, so this one was measured
+first.
+
+A fresh 40-game corpus vs `sf:nodes=1` (7W-16D-17L, score 0.375, Elo **-89** [-194, +3])
+reproduces the baseline row above. Each of the engine's **1765 moves** was then re-scored under
+the model and evaluated by Stockfish at depth 12 before and after. Two instrument checks passed
+first: the rebuilt transcript prefix matches `test_engine.transcript`, and the top-scoring move
+equals the move actually played in **1765 of 1765** positions, which is what determinism should
+look like.
+
+> Book plies are not engine moves - `match.py` plays the opening itself and never consults
+> either player (`match.py:292-295`). Counting them costs nothing in the match but silently adds
+> positions the model never chose; excluding them is what makes 1765 agree exactly with the move
+> count `match.py` reports.
+
+### Spelling audit (Phase 2): clean, no change to `_spellings`
+
+`engine._spellings` (`engine.py:29`) knows only `#`->`+`. Every other spelling the model might
+plausibly prefer was scored against python-chess's own, in the same packed forward pass, over
+~440 sampled positions. Delta is `logprob(alternate) - logprob(canonical)` in nats, so positive
+would mean a leak:
+
+| bucket | example | n | mean delta | alternate wins |
+|---|---|---|---|---|
+| `mate_as_plus` (**control**) | `Qf7#`->`Qf7+` | 3 | **+9.30** | 100% |
+| under-disambiguated | `Ree7`->`Re7` | 464 | -9.29 | 1.3% |
+| over-disambiguated (file) | `Nb4`->`Ndb4` | 1939 | -17.70 | 0.1% |
+| over-disambiguated (rank/full) | `Ba2`->`B6a2` | 3870 | -18.7 / -34.0 | 0.0% |
+| check suffix dropped | `Rb7+`->`Rb7` | 258 | -16.68 | 0.0% |
+| capture `x` dropped | `gxh6`->`gh6` | 72 | -23.77 | 0.0% |
+| promotion `=` dropped | `d8=Q`->`d8Q` | 12 | -32.66 | 0.0% |
+| castling as digits | `O-O`->`0-0` | 19 | -53.64 | 0.0% |
+
+The control reproduces the already-known mate effect at +9.30 nats, which is what says the audit
+is measuring anything at all. **Nothing else leaks.** The model writes SAN exactly as
+python-chess does, including disambiguation - the bucket that was never checked and that a
+tactical filter would lean on hardest. Phase 2 closes with no code change.
+
+### Blunder census: the premise does not hold
+
+Of 1765 engine moves, 6.4% lose at least 200cp at depth 12 (5.9% restricted to live positions,
+`|eval| < 800`; half the corpus is adjudicated and pinned at the clamp, where a drop is
+mechanically near zero). Breaking down those 113 blunders:
+
+| what the blunder is | moves | share |
+|---|---|---|
+| the moved piece lands where a swap-off wins it | 16 | **14.2%** |
+| the move leaves something else newly takeable | 6 | 5.3% |
+| something was already takeable and the move ignored it | 10 | 8.8% |
+| no material hanging at all - positional, or tactics deeper than one exchange | 81 | **71.7%** |
+
+**Only 14% of the engine's blunders are the kind a destination-square SEE filter can see**, and
+they account for 10% of the centipawns it throws away. The dominant failure mode is not hanging
+pieces; it is play that is simply worse than it looks one exchange deep. The Phase 3 premise is
+wrong - with the caveat that this is one opponent's worth of evidence, `sf:nodes=1`, and whether
+the mix shifts against stronger opposition is untested. The 86%-out-of-reach margin is wide
+enough that it would have to shift a long way to change the verdict.
+
+### What the filter would actually do
+
+Simulated over the same 1765 positions (reject a candidate with SEE <= -100, take the best
+surviving move from the top 5):
+
+- it fires on **54 moves (3.1%)**, taking the second-choice move in 47 of those
+- when it fires it gains **+30cp on average, 95% CI [-53, +113]** - the interval contains zero
+- the replacement is better 27 times, worse 24, identical 3 (sign test p = 0.39)
+
+It does work on the cases it was designed for: on the 16 firings that were real blunders it
+recovers +5575cp of the 6217 lost there. But the other 38 firings give almost all of it back -
+positions where the model was playing a sound sacrifice, or where a swap-off eval misjudges the
+position. **False positives cost about what the true positives gain.**
+
+Making the trigger stricter does not rescue it. Raising the SEE bar, requiring the policy to be
+nearly indifferent, or both, all raise the gain *per firing* while cutting the firing rate by
+about as much:
+
+| trigger | firings | mean gain | 95% CI | per engine move |
+|---|---|---|---|---|
+| SEE <= -100 (as specified) | 54 | +30cp | [-53, +113] | +0.91 cp |
+| SEE <= -300 | 16 | +115cp | [-125, +354] | +1.04 cp |
+| policy cost <= 1.0 nats | 34 | +62cp | [-44, +167] | +1.19 cp |
+| SEE <= -300 and cost <= 1.0 nats | 11 | +161cp | [-102, +424] | +1.00 cp |
+
+Every row sits between +0.3 and +1.2 cp per engine move and every interval spans zero. (One
+narrower slice, SEE <= -500 with cost <= 1.0 nats, does exclude zero at n=7 - across fourteen
+thresholds tried, that is what chance produces, and it is not a result.)
+
+### Converting that to Elo, and why the answer is a range
+
+`second:gap=1.0` gives a fixed point: BASELINE measured it at -117 Elo. It fires on 52.1% of
+moves and gives up a mean of only 3cp per override, i.e. -1.4 cp/move. Scaling the filter's
++0.9 cp/move by that exchange rate puts it at **+74 Elo**.
+
+Do not read that as the expected gain. It is the optimistic tail of a mean whose own interval is
+[-53, +113] cp, and the filter's *median* firing gains +2cp - run the same conversion off the
+medians and the answer is +3 Elo. The point estimate is not distinguishable from zero; +74 is
+what the top of the interval would be worth if it were real. The conversion factor is doing
+enormous work either way: a one-ply depth-12 eval barely separates the policy's top two moves
+(3cp) even though consistently taking the second one costs over 100 Elo, so none of this is
+trustworthy to better than an order of magnitude. Sized against the power table above and
+inflated for the 11 of 40 games in which the filter never fires at all - those play out
+byte-identically and score exactly 0.500, carrying no information - even the optimistic +74
+would need **~90 games** to clear zero, and anything near the point estimate is unmeasurable at
+any practical number of games.
+
+### Verdict: Phase 3 does not ship; go to Phase 4
+
+Three independent readings agree, and none of them depends on the shaky Elo conversion:
+
+1. **86% of the engine's blunders are out of the filter's reach** by construction.
+2. **Its measured benefit contains zero** at every trigger threshold tried.
+3. **No threshold improves cp/move** - selectivity trades firing rate against gain at par.
+
+The 72% "positional or deeper than one exchange" bucket is the actual target, and it is exactly
+what a value head (Phase 4) and policy-pruned search (Phase 5) address. Phase 4 becomes the next
+step; the SEE filter is not worth the several CPU-hours its gate match would cost, and the
+`engine.py` complexity it would add is complexity spent on a seventh of the problem.
+
+Two things from this work are worth keeping if Phase 5 ever needs them: the SEE routine itself
+(python-chess ships none; `attackers_mask(color, square, occupied)` takes a custom occupancy, so
+x-rays behind a departing attacker come out right), and the finding that the model's SAN
+spelling needs no special-casing beyond the mate suffix.
+
 ## Notes for re-running
 
 - Matches are adjudicated once Stockfish sees ±900cp for 4 consecutive plies, which roughly
